@@ -10,7 +10,7 @@ export async function onRequest(context) {
     const { request, env, waitUntil } = context;
     const url = new URL(request.url);
 
-    // 1. 解析目标 URL (注意这里是 /p2/)
+    // 1. 解析目标 URL (匹配 /p2/ 路径)
     const targetUrl = getTargetUrlFromPath(url.pathname);
     if (!targetUrl) {
         return createResponse("无效的代理请求", 400, {}, request);
@@ -61,10 +61,10 @@ export async function onRequest(context) {
 
         // 6. 根据内容类型进行处理
         if (isMedia || contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/')) {
-            // --- 情况 A: 图片/视频二进制内容 ---
+            // --- 情况 A: 图片/视频二进制内容 (核心修复：绝对不使用 .text()) ---
             const finalHeaders = new Headers(response.headers);
             finalHeaders.set('Access-Control-Allow-Origin', '*');
-            // 【关键】强制不缓存，防止再次中毒
+            // 强制不缓存，防止旧的坏数据再次中毒
             finalHeaders.set('Cache-Control', 'no-store, max-age=0');
 
             return new Response(response.body, {
@@ -98,7 +98,7 @@ export async function onRequest(context) {
 }
 
 /**
- * 智能 Fetch
+ * 智能 Fetch (包含豆瓣伪装)
  */
 async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
@@ -145,7 +145,6 @@ async function validateAuth(request, env) {
 }
 
 function getTargetUrlFromPath(pathname) {
-    // 【关键改动】这里匹配 /p2/ 路径
     const encodedUrl = pathname.replace(/^\/p2\//, '');
     if (!encodedUrl) return null;
     try {
@@ -455,3 +454,4 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
