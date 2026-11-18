@@ -26,7 +26,7 @@ export async function onRequest(context) {
         if (env.USER_AGENTS_JSON) USER_AGENTS = JSON.parse(env.USER_AGENTS_JSON);
     } catch (e) {}
 
-    // 3. 鉴权判断
+    // 3. 鉴权判断 (媒体文件自动跳过)
     const isMedia = MEDIA_REGEX.test(targetUrl);
     if (!isMedia) {
         const isValidAuth = await validateAuth(request, env);
@@ -35,16 +35,10 @@ export async function onRequest(context) {
         }
     }
 
-    // 4. 缓存与请求逻辑
+    // 4. 缓存检查 (仅针对文本/M3U8)
     const cacheKey = `proxy_raw:${targetUrl}`;
     let kvNamespace = env.LIBRETV_PROXY_KV;
 
-    // 【核心修复】如果是媒体文件 (图片/视频)，直接跳过 KV 缓存，防止读取到旧的损坏数据
-    if (isMedia) {
-        return await fetchAndStreamMedia(targetUrl, USER_AGENTS, request, CACHE_TTL);
-    }
-
-    // 如果不是媒体文件 (例如 M3U8)，才尝试使用 KV 缓存
     if (kvNamespace) {
         try {
             const cachedDataJson = await kvNamespace.get(cacheKey);
@@ -61,74 +55,60 @@ export async function onRequest(context) {
         } catch (e) {}
     }
 
-    // 5. 实际请求 (针对 M3U8/文本)
+    // 5. 发起请求
     try {
-        const { response, isText } = await fetchWithSmartHandling(targetUrl, USER_AGENTS, request);
+        const { response, contentType } = await fetchWithSmartHandling(targetUrl, USER_AGENTS, request);
 
-        if (isText) {
-            const content = await response.text();
-            const contentType = response.headers.get('content-type') || '';
+        // --- 【核心修复：绝对隔离逻辑】 ---
+        // 如果 Content-Type 是图片、视频或音频，绝对不读取内容，直接流式透传
+        if (contentType.startsWith('image/') || 
+            contentType.startsWith('video/') || 
+            contentType.startsWith('audio/')) {
+            
+            const finalHeaders = new Headers(response.headers);
+            finalHeaders.set('Access-Control-Allow-Origin', '*');
+            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
-            if (kvNamespace) {
+            // 直接返回 response.body (Stream)，不调用 .text()，保证数据 100% 完整
+            return new Response(response.body, {
+                status: 200,
+                headers: finalHeaders
+            });
+        }
+
+        // --- 如果是文本内容 (M3U8) ---
+        const content = await response.text();
+
+        // 写入缓存
+        if (kvNamespace) {
+            try {
                 const headersToCache = {};
                 response.headers.forEach((v, k) => { headersToCache[k.toLowerCase()] = v; });
                 const cacheValue = JSON.stringify({ body: content, headers: JSON.stringify(headersToCache), contentType });
                 waitUntil(kvNamespace.put(cacheKey, cacheValue, { expirationTtl: CACHE_TTL }));
-            }
-
-            if (isM3u8Content(content, contentType)) {
-                const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
-                return createM3u8Response(processedM3u8, CACHE_TTL, request);
-            } else {
-                return createResponse(content, 200, response.headers, request);
-            }
-        } else {
-            // 如果不是文本但没进 isMedia (理论上不会)，也进行流式传输
-            return new Response(response.body, {
-                status: 200,
-                headers: createCorsHeaders(response.headers)
-            });
+            } catch (e) {}
         }
+
+        if (isM3u8Content(content, contentType)) {
+            const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
+            return createM3u8Response(processedM3u8, CACHE_TTL, request);
+        } else {
+            return createResponse(content, 200, response.headers, request);
+        }
+
     } catch (error) {
         return createResponse(`Proxy Error: ${error.message}`, 500, {}, request);
     }
 }
 
 /**
- * 专门处理媒体文件的函数：直接流式传输，不经过 KV，不损坏数据
+ * 智能 Fetch：不仅处理 User-Agent，还负责返回原始响应对象
  */
-async function fetchAndStreamMedia(targetUrl, userAgents, request, cacheTtl) {
-    const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
-    const targetUrlObj = new URL(targetUrl);
-    
-    let referer = request.headers.get('Referer') || targetUrlObj.origin;
-    if (targetUrlObj.hostname.includes('douban.com')) {
-        referer = 'https://movie.douban.com/';
-    }
-
-    const headers = new Headers({
-        'User-Agent': ua,
-        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'Accept-Language': request.headers.get('Accept-Language') || 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Referer': referer,
-    });
-
-    const response = await fetch(targetUrl, { headers, redirect: 'follow' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    const finalHeaders = new Headers(response.headers);
-    finalHeaders.set('Access-Control-Allow-Origin', '*');
-    finalHeaders.set('Cache-Control', `public, max-age=${cacheTtl}`);
-
-    return new Response(response.body, {
-        status: 200,
-        headers: finalHeaders
-    });
-}
-
 async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
     const targetUrlObj = new URL(targetUrl);
+    
+    // 深度伪装豆瓣
     let referer = request.headers.get('Referer') || targetUrlObj.origin;
     if (targetUrlObj.hostname.includes('douban.com')) {
         referer = 'https://movie.douban.com/';
@@ -144,12 +124,10 @@ async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const response = await fetch(targetUrl, { headers, redirect: 'follow' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const contentType = response.headers.get('content-type') || '';
-    const isText = contentType.includes('text/') || 
-                   contentType.includes('application/x-mpegurl') || 
-                   contentType.includes('application/vnd.apple.mpegurl');
-
-    return { response, isText };
+    return { 
+        response, 
+        contentType: response.headers.get('content-type') || '' 
+    };
 }
 
 // --- 辅助函数 ---
@@ -180,16 +158,11 @@ function getTargetUrlFromPath(pathname) {
     } catch (e) { return null; }
 }
 
-function createCorsHeaders(headers) {
-    const h = new Headers(headers);
-    h.set("Access-Control-Allow-Origin", "*");
-    h.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-    h.set("Access-Control-Allow-Headers", "*");
-    return h;
-}
-
 function createResponse(body, status = 200, headers = {}, request) {
-    const responseHeaders = createCorsHeaders(headers);
+    const responseHeaders = new Headers(headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Headers", "*");
     return new Response(body, { status, headers: responseHeaders });
 }
 
@@ -486,5 +459,6 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
 
 
