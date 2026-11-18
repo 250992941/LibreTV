@@ -35,8 +35,9 @@ export async function onRequest(context) {
         }
     }
 
-    // 4. 缓存检查 (仅针对文本/M3U8)
-    const cacheKey = `proxy_raw:${targetUrl}`;
+    // 4. 缓存检查 (使用 v2 版本键名以强制刷新)
+    // 【关键改动】将 proxy_raw 改为 proxy_v2，彻底避开旧的损坏缓存
+    const cacheKey = `proxy_v2:${targetUrl}`; 
     let kvNamespace = env.LIBRETV_PROXY_KV;
 
     if (kvNamespace) {
@@ -59,41 +60,38 @@ export async function onRequest(context) {
     try {
         const { response, contentType } = await fetchWithSmartHandling(targetUrl, USER_AGENTS, request);
 
-        // --- 【核心修复：绝对隔离逻辑】 ---
-        // 如果 Content-Type 是图片、视频或音频，绝对不读取内容，直接流式透传
-        if (contentType.startsWith('image/') || 
-            contentType.startsWith('video/') || 
-            contentType.startsWith('audio/')) {
-            
+        // 6. 根据内容类型进行处理
+        if (isMedia || contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/')) {
+            // --- 情况 A: 图片/视频二进制内容 (绝对不使用 .text()) ---
             const finalHeaders = new Headers(response.headers);
             finalHeaders.set('Access-Control-Allow-Origin', '*');
             finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
-            // 直接返回 response.body (Stream)，不调用 .text()，保证数据 100% 完整
+            // 直接流式透传，保证数据 100% 完美
             return new Response(response.body, {
                 status: 200,
                 headers: finalHeaders
             });
-        }
-
-        // --- 如果是文本内容 (M3U8) ---
-        const content = await response.text();
-
-        // 写入缓存
-        if (kvNamespace) {
-            try {
-                const headersToCache = {};
-                response.headers.forEach((v, k) => { headersToCache[k.toLowerCase()] = v; });
-                const cacheValue = JSON.stringify({ body: content, headers: JSON.stringify(headersToCache), contentType });
-                waitUntil(kvNamespace.put(cacheKey, cacheValue, { expirationTtl: CACHE_TTL }));
-            } catch (e) {}
-        }
-
-        if (isM3u8Content(content, contentType)) {
-            const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
-            return createM3u8Response(processedM3u8, CACHE_TTL, request);
         } else {
-            return createResponse(content, 200, response.headers, request);
+            // --- 情况 B: M3U8 文本内容 ---
+            const content = await response.text();
+
+            // 写入新版本的缓存 (v2)
+            if (kvNamespace) {
+                try {
+                    const headersToCache = {};
+                    response.headers.forEach((v, k) => { headersToCache[k.toLowerCase()] = v; });
+                    const cacheValue = JSON.stringify({ body: content, headers: JSON.stringify(headersToCache), contentType });
+                    waitUntil(kvNamespace.put(cacheKey, cacheValue, { expirationTtl: CACHE_TTL }));
+                } catch (e) {}
+            }
+
+            if (isM3u8Content(content, contentType)) {
+                const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
+                return createM3u8Response(processedM3u8, CACHE_TTL, request);
+            } else {
+                return createResponse(content, 200, response.headers, request);
+            }
         }
 
     } catch (error) {
@@ -102,13 +100,12 @@ export async function onRequest(context) {
 }
 
 /**
- * 智能 Fetch：不仅处理 User-Agent，还负责返回原始响应对象
+ * 智能 Fetch
  */
 async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
     const targetUrlObj = new URL(targetUrl);
     
-    // 深度伪装豆瓣
     let referer = request.headers.get('Referer') || targetUrlObj.origin;
     if (targetUrlObj.hostname.includes('douban.com')) {
         referer = 'https://movie.douban.com/';
@@ -459,6 +456,7 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
 
 
 
