@@ -1,233 +1,195 @@
-// /api/proxy/[...path].mjs - Vercel Serverless Function (ES Module)
+// functions/proxy/[[path]].js
 
-import fetch from 'node-fetch';
-import { URL } from 'url'; // 使用 Node.js 内置 URL 处理
-import crypto from 'crypto'; // 导入 crypto 模块用于密码哈希
+// --- 常量定义 ---
+// 极其精准的媒体文件正则，支持带参数的 URL
+const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|wmv|flv|f4v|m4v|3gp|3g2|ts|mts|m2ts|mp3|wav|ogg|aac|m4a|flac|wma|alac|aiff|opus|jpg|jpeg|png|gif|webp|bmp|tiff|svg|avif|heic)(\?.*)?$/i;
 
-// --- 配置 (从环境变量读取) ---
-const DEBUG_ENABLED = process.env.DEBUG === 'true';
-const CACHE_TTL = parseInt(process.env.CACHE_TTL || '86400', 10); // 默认 24 小时
-const MAX_RECURSION = parseInt(process.env.MAX_RECURSION || '5', 10); // 默认 5 层
+/**
+ * 主要的 Pages Function 处理函数
+ */
+export async function onRequest(context) {
+    const { request, env, waitUntil } = context;
+    const url = new URL(request.url);
 
-// --- User Agent 处理 ---
-// 默认 User Agent 列表
-let USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
-];
-// 尝试从环境变量读取并解析 USER_AGENTS_JSON
-try {
-    const agentsJsonString = process.env.USER_AGENTS_JSON;
-    if (agentsJsonString) {
-        const parsedAgents = JSON.parse(agentsJsonString);
-        // 检查解析结果是否为非空数组
-        if (Array.isArray(parsedAgents) && parsedAgents.length > 0) {
-            USER_AGENTS = parsedAgents; // 使用环境变量中的数组
-            console.log(`[代理日志] 已从环境变量加载 ${USER_AGENTS.length} 个 User Agent。`);
-        } else {
-            console.warn("[代理日志] 环境变量 USER_AGENTS_JSON 不是有效的非空数组，使用默认值。");
-        }
-    } else {
-        console.log("[代理日志] 未设置环境变量 USER_AGENTS_JSON，使用默认 User Agent。");
+    // 1. 解析目标 URL
+    const targetUrl = getTargetUrlFromPath(url.pathname);
+    if (!targetUrl) {
+        return createResponse("无效的代理请求", 400, {}, request);
     }
-} catch (e) {
-    // 如果 JSON 解析失败，记录错误并使用默认值
-    console.error(`[代理日志] 解析环境变量 USER_AGENTS_JSON 出错: ${e.message}。使用默认 User Agent。`);
+
+    // 2. 配置读取
+    const DEBUG_ENABLED = (env.DEBUG === 'true');
+    const CACHE_TTL = parseInt(env.CACHE_TTL || '86400');
+    const MAX_RECURSION = parseInt(env.MAX_RECURSION || '5');
+    
+    let USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'];
+    try {
+        if (env.USER_AGENTS_JSON) USER_AGENTS = JSON.parse(env.USER_AGENTS_JSON);
+    } catch (e) {}
+
+    // 3. 鉴权判断 (媒体文件自动跳过)
+    const isMedia = MEDIA_REGEX.test(targetUrl);
+    if (!isMedia) {
+        const isValidAuth = await validateAuth(request, env);
+        if (!isValidAuth) {
+            return createResponse(JSON.stringify({ success: false, error: 'Unauthorized' }), 401, { 'Content-Type': 'application/json' }, request);
+        }
+    }
+
+    // 4. 缓存检查 (仅针对文本/M3U8)
+    const cacheKey = `proxy_raw:${targetUrl}`;
+    let kvNamespace = env.LIBRETV_PROXY_KV;
+
+    if (kvNamespace) {
+        try {
+            const cachedDataJson = await kvNamespace.get(cacheKey);
+            if (cachedDataJson) {
+                const cachedData = JSON.parse(cachedDataJson);
+                const contentType = cachedData.contentType || '';
+                if (isM3u8Content(cachedData.body, contentType)) {
+                    const processedM3u8 = await processM3u8Content(targetUrl, cachedData.body, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
+                    return createM3u8Response(processedM3u8, CACHE_TTL, request);
+                } else {
+                    return createResponse(cachedData.body, 200, cachedData.headers, request);
+                }
+            }
+        } catch (e) {}
+    }
+
+    // 5. 发起请求
+    try {
+        const { response, isText } = await fetchWithSmartHandling(targetUrl, USER_AGENTS, request);
+
+        // 6. 根据内容类型进行处理
+        if (isText) {
+            // --- 情况 A: M3U8 文本内容 (需要读取并重写路径) ---
+            const content = await response.text();
+            const contentType = response.headers.get('content-type') || '';
+
+            // 写入缓存
+            if (kvNamespace) {
+                const headersToCache = {};
+                response.headers.forEach((v, k) => { headersToCache[k.toLowerCase()] = v; });
+                const cacheValue = JSON.stringify({ body: content, headers: JSON.stringify(headersToCache), contentType });
+                waitUntil(kvNamespace.put(cacheKey, cacheValue, { expirationTtl: CACHE_TTL }));
+            }
+
+            if (isM3u8Content(content, contentType)) {
+                const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env, CACHE_TTL, MAX_RECURSION, USER_AGENTS, kvNamespace, waitUntil, DEBUG_ENABLED);
+                return createM3u8Response(processedM3u8, CACHE_TTL, request);
+            } else {
+                return createResponse(content, 200, response.headers, request);
+            }
+        } else {
+            // --- 情况 B: 图片/视频二进制内容 (核心修复：直接流式透传) ---
+            const finalHeaders = new Headers(response.headers);
+            finalHeaders.set('Access-Control-Allow-Origin', '*');
+            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
+
+            // 直接返回 response.body (Stream)，不调用 .text()，保证图片不损坏
+            return new Response(response.body, {
+                status: 200,
+                headers: finalHeaders
+            });
+        }
+
+    } catch (error) {
+        return createResponse(`Proxy Error: ${error.message}`, 500, {}, request);
+    }
 }
-
-// 广告过滤在代理中禁用，由播放器处理
-const FILTER_DISCONTINUITY = false;
-
 
 // --- 辅助函数 ---
 
-function logDebug(message) {
-    if (DEBUG_ENABLED) {
-        console.log(`[代理日志] ${message}`);
-    }
-}
-
 /**
- * 从代理请求路径中提取编码后的目标 URL。
- * @param {string} encodedPath - URL 编码后的路径部分 (例如 "https%3A%2F%2F...")
- * @returns {string|null} 解码后的目标 URL，如果无效则返回 null。
+ * 核心修复：智能 fetch，根据内容类型决定是否转为文本
  */
-function getTargetUrlFromPath(encodedPath) {
-    if (!encodedPath) {
-        logDebug("getTargetUrlFromPath 收到空路径。");
-        return null;
+async function fetchWithSmartHandling(targetUrl, userAgents, request) {
+    const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
+    const targetUrlObj = new URL(targetUrl);
+    
+    // 深度伪装豆瓣
+    let referer = request.headers.get('Referer') || targetUrlObj.origin;
+    if (targetUrlObj.hostname.includes('douban.com')) {
+        referer = 'https://movie.douban.com/';
     }
+
+    const headers = new Headers({
+        'User-Agent': ua,
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language': request.headers.get('Accept-Language') || 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': referer,
+    });
+
+    const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    // 预判是否为文本（M3U8）
+    const contentType = response.headers.get('content-type') || '';
+    const isText = contentType.includes('mpegurl') || contentType.includes('text/plain') || contentType.includes('application/x-mpegurl');
+
+    return { response, isText };
+}
+
+async function validateAuth(request, env) {
+    const url = new URL(request.url);
+    const authHash = url.searchParams.get('auth');
+    const timestamp = url.searchParams.get('t');
+    const serverPassword = env.PASSWORD;
+    if (!serverPassword) return false;
     try {
-        const decodedUrl = decodeURIComponent(encodedPath);
-        // 基础检查，看是否像一个 HTTP/HTTPS URL
-        if (decodedUrl.match(/^https?:\/\/.+/i)) {
-            return decodedUrl;
-        } else {
-            logDebug(`无效的解码 URL 格式: ${decodedUrl}`);
-            // 备选检查：原始路径是否未编码但看起来像 URL？
-            if (encodedPath.match(/^https?:\/\/.+/i)) {
-                logDebug(`警告: 路径未编码但看起来像 URL: ${encodedPath}`);
-                return encodedPath;
-            }
-            return null;
-        }
-    } catch (e) {
-        // 捕获解码错误 (例如格式错误的 URI)
-        logDebug(`解码目标 URL 出错: ${encodedPath} - ${e.message}`);
-        return null;
-    }
-}
-
-function getBaseUrl(urlStr) {
-    if (!urlStr) return '';
-    try {
-        const parsedUrl = new URL(urlStr);
-        // 处理根目录或只有文件名的情况
-        const pathSegments = parsedUrl.pathname.split('/').filter(Boolean); // 移除空字符串
-        if (pathSegments.length <= 1) {
-            return `${parsedUrl.origin}/`;
-        }
-        pathSegments.pop(); // 移除最后一段
-        return `${parsedUrl.origin}/${pathSegments.join('/')}/`;
-    } catch (e) {
-        logDebug(`获取 BaseUrl 失败: "${urlStr}": ${e.message}`);
-        // 备用方法：查找最后一个斜杠
-        const lastSlashIndex = urlStr.lastIndexOf('/');
-        if (lastSlashIndex > urlStr.indexOf('://') + 2) { // 确保不是协议部分的斜杠
-            return urlStr.substring(0, lastSlashIndex + 1);
-        }
-        return urlStr + '/'; // 如果没有路径，添加斜杠
-    }
-}
-
-function resolveUrl(baseUrl, relativeUrl) {
-    if (!relativeUrl) return ''; // 处理空的 relativeUrl
-    if (relativeUrl.match(/^https?:\/\/.+/i)) {
-        return relativeUrl; // 已经是绝对 URL
-    }
-    if (!baseUrl) return relativeUrl; // 没有基础 URL 无法解析
-
-    try {
-        // 使用 Node.js 的 URL 构造函数处理相对路径
-        return new URL(relativeUrl, baseUrl).toString();
-    } catch (e) {
-        logDebug(`URL 解析失败: base="${baseUrl}", relative="${relativeUrl}". 错误: ${e.message}`);
-        // 简单的备用逻辑
-        if (relativeUrl.startsWith('/')) {
-             try {
-                const baseOrigin = new URL(baseUrl).origin;
-                return `${baseOrigin}${relativeUrl}`;
-             } catch { return relativeUrl; } // 如果 baseUrl 也无效，返回原始相对路径
-        } else {
-            // 假设相对于包含基础 URL 资源的目录
-            return `${baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1)}${relativeUrl}`;
-        }
-    }
-}
-
-// ** 已修正：确保生成 /proxy/ 前缀的链接 **
-function rewriteUrlToProxy(targetUrl) {
-    if (!targetUrl || typeof targetUrl !== 'string') return '';
-    // 返回与 vercel.json 的 "source" 和前端 PROXY_URL 一致的路径
-    return `/proxy/${encodeURIComponent(targetUrl)}`;
-}
-
-function getRandomUserAgent() {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-async function fetchContentWithType(targetUrl, requestHeaders) {
-    // 准备请求头
-    const headers = {
-        'User-Agent': getRandomUserAgent(),
-        'Accept': requestHeaders['accept'] || '*/*', // 传递原始 Accept 头（如果有）
-        'Accept-Language': requestHeaders['accept-language'] || 'zh-CN,zh;q=0.9,en;q=0.8',
-        // 尝试设置一个合理的 Referer
-        'Referer': requestHeaders['referer'] || new URL(targetUrl).origin,
-    };
-    // 清理空值的头
-    Object.keys(headers).forEach(key => headers[key] === undefined || headers[key] === null || headers[key] === '' ? delete headers[key] : {});
-
-    logDebug(`准备请求目标: ${targetUrl}，请求头: ${JSON.stringify(headers)}`);
-
-    try {
-        // 发起 fetch 请求
-        const response = await fetch(targetUrl, { headers, redirect: 'follow' });
-
-        // 检查响应是否成功
-        if (!response.ok) {
-            const errorBody = await response.text().catch(() => ''); // 尝试获取错误响应体
-            logDebug(`请求失败: ${response.status} ${response.statusText} - ${targetUrl}`);
-            // 创建一个包含状态码的错误对象
-            const err = new Error(`HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`);
-            err.status = response.status; // 将状态码附加到错误对象
-            throw err; // 抛出错误
-        }
-
-        // 读取响应内容
-        const content = await response.text();
-        const contentType = response.headers.get('content-type') || '';
-        logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
-        // 返回结果
-        return { content, contentType, responseHeaders: response.headers };
-
-    } catch (error) {
-        // 捕获 fetch 本身的错误（网络、超时等）或上面抛出的 HTTP 错误
-        logDebug(`请求异常 ${targetUrl}: ${error.message}`);
-        // 重新抛出，确保包含原始错误信息
-        throw new Error(`请求目标 URL 失败 ${targetUrl}: ${error.message}`);
-    }
-}
-
-function isM3u8Content(content, contentType) {
-    if (contentType && (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('application/x-mpegurl') || contentType.includes('audio/mpegurl'))) {
+        const encoder = new TextEncoder();
+        const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(serverPassword));
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const serverPasswordHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        if (!authHash || authHash !== serverPasswordHash) return false;
+        if (timestamp && (Date.now() - parseInt(timestamp) > 600000)) return false;
         return true;
-    }
-    return content && typeof content === 'string' && content.trim().startsWith('#EXTM3U');
+    } catch (e) { return false; }
 }
 
-function processKeyLine(line, baseUrl) {
-    return line.replace(/URI="([^"]+)"/, (match, uri) => {
-        const absoluteUri = resolveUrl(baseUrl, uri);
-        logDebug(`处理 KEY URI: 原始='${uri}', 绝对='${absoluteUri}'`);
-        return `URI="${rewriteUrlToProxy(absoluteUri)}"`;
+function getTargetUrlFromPath(pathname) {
+    const encodedUrl = pathname.replace(/^\/proxy\//, '');
+    if (!encodedUrl) return null;
+    try {
+        let decoded = decodeURIComponent(encodedUrl);
+        return decoded.match(/^https?:\/\//i) ? decoded : null;
+    } catch (e) { return null; }
+}
+
+function createResponse(body, status = 200, headers = {}, request) {
+    const responseHeaders = new Headers(headers);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Headers", "*");
+    return new Response(body, { status, headers: responseHeaders });
+}
+
+function createM3u8Response(content, ttl, request) {
+    return new Response(content, {
+        status: 200,
+        headers: {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Cache-Control": `public, max-age=${ttl}`,
+            "Access-Control-Allow-Origin": "*"
+        }
     });
 }
 
-function processMapLine(line, baseUrl) {
-     return line.replace(/URI="([^"]+)"/, (match, uri) => {
-        const absoluteUri = resolveUrl(baseUrl, uri);
-        logDebug(`处理 MAP URI: 原始='${uri}', 绝对='${absoluteUri}'`);
-        return `URI="${rewriteUrlToProxy(absoluteUri)}"`;
-     });
- }
+function isM3u8Content(content, contentType) {
+    if (contentType && (contentType.includes('mpegurl') || contentType.includes('x-mpegurl'))) return true;
+    return content && typeof content === 'string' && content.trim().startsWith('#EXTM3U');
+}
 
-function processMediaPlaylist(url, content) {
-    const baseUrl = getBaseUrl(url);
-    if (!baseUrl) {
-        logDebug(`无法确定媒体列表的 Base URL: ${url}，相对路径可能无法处理。`);
-    }
-    const lines = content.split('\n');
-    const output = [];
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        // 保留最后一个空行
-        if (!line && i === lines.length - 1) { output.push(line); continue; }
-        if (!line) continue; // 跳过中间空行
-        // 广告过滤已禁用
-        if (line.startsWith('#EXT-X-KEY')) { output.push(processKeyLine(line, baseUrl)); continue; }
-        if (line.startsWith('#EXT-X-MAP')) { output.push(processMapLine(line, baseUrl)); continue; }
-        if (line.startsWith('#EXTINF')) { output.push(line); continue; }
-        // 处理 URL 行
-        if (!line.startsWith('#')) {
-            const absoluteUrl = resolveUrl(baseUrl, line);
-            logDebug(`重写媒体片段: 原始='${line}', 解析后='${absoluteUrl}'`);
-            output.push(rewriteUrlToProxy(absoluteUrl)); continue;
-        }
-        // 保留其他 M3U8 标签
-        output.push(line);
-    }
-    return output.join('\n');
+export async function onOptions(context) {
+    return new Response(null, {
+        status: 204,
+        headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        },
+    });
 }
 
 async function processM3u8Content(targetUrl, content, recursionDepth = 0) {
@@ -495,3 +457,4 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
