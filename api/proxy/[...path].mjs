@@ -1,7 +1,6 @@
 // functions/proxy/[[path]].js
 
 // --- 常量定义 ---
-// 极其精准的媒体文件正则，用于识别哪些文件需要“直接搬运”而不进行文本解析
 const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|wmv|flv|f4v|m4v|3gp|3g2|ts|mts|m2ts|mp3|wav|ogg|aac|m4a|flac|wma|alac|aiff|opus|jpg|jpeg|png|gif|webp|bmp|tiff|svg|avif|heic)(\?.*)?$/i;
 
 /**
@@ -27,7 +26,7 @@ export async function onRequest(context) {
         if (env.USER_AGENTS_JSON) USER_AGENTS = JSON.parse(env.USER_AGENTS_JSON);
     } catch (e) {}
 
-    // 3. 鉴权判断 (媒体文件自动跳过)
+    // 3. 鉴权判断
     const isMedia = MEDIA_REGEX.test(targetUrl);
     if (!isMedia) {
         const isValidAuth = await validateAuth(request, env);
@@ -36,10 +35,16 @@ export async function onRequest(context) {
         }
     }
 
-    // 4. 缓存检查 (仅针对文本/M3U8)
+    // 4. 缓存与请求逻辑
     const cacheKey = `proxy_raw:${targetUrl}`;
     let kvNamespace = env.LIBRETV_PROXY_KV;
 
+    // 【核心修复】如果是媒体文件 (图片/视频)，直接跳过 KV 缓存，防止读取到旧的损坏数据
+    if (isMedia) {
+        return await fetchAndStreamMedia(targetUrl, USER_AGENTS, request, CACHE_TTL);
+    }
+
+    // 如果不是媒体文件 (例如 M3U8)，才尝试使用 KV 缓存
     if (kvNamespace) {
         try {
             const cachedDataJson = await kvNamespace.get(cacheKey);
@@ -56,17 +61,14 @@ export async function onRequest(context) {
         } catch (e) {}
     }
 
-    // 5. 发起请求
+    // 5. 实际请求 (针对 M3U8/文本)
     try {
         const { response, isText } = await fetchWithSmartHandling(targetUrl, USER_AGENTS, request);
 
-        // 6. 根据内容类型进行处理
         if (isText) {
-            // --- 情况 A: M3U8 文本内容 (需要读取并重写路径) ---
             const content = await response.text();
             const contentType = response.headers.get('content-type') || '';
 
-            // 写入缓存
             if (kvNamespace) {
                 const headersToCache = {};
                 response.headers.forEach((v, k) => { headersToCache[k.toLowerCase()] = v; });
@@ -81,31 +83,24 @@ export async function onRequest(context) {
                 return createResponse(content, 200, response.headers, request);
             }
         } else {
-            // --- 情况 B: 图片/视频二进制内容 (核心修复：直接流式透传) ---
-            const finalHeaders = new Headers(response.headers);
-            finalHeaders.set('Access-Control-Allow-Origin', '*');
-            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
-
-            // 【关键修复】直接返回 response.body (Stream)，不调用 .text()，保证二进制数据 100% 完整
+            // 如果不是文本但没进 isMedia (理论上不会)，也进行流式传输
             return new Response(response.body, {
                 status: 200,
-                headers: finalHeaders
+                headers: createCorsHeaders(response.headers)
             });
         }
-
     } catch (error) {
         return createResponse(`Proxy Error: ${error.message}`, 500, {}, request);
     }
 }
 
 /**
- * 智能 Fetch：根据 Content-Type 预判是文本还是二进制
+ * 专门处理媒体文件的函数：直接流式传输，不经过 KV，不损坏数据
  */
-async function fetchWithSmartHandling(targetUrl, userAgents, request) {
+async function fetchAndStreamMedia(targetUrl, userAgents, request, cacheTtl) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
     const targetUrlObj = new URL(targetUrl);
     
-    // 深度伪装豆瓣
     let referer = request.headers.get('Referer') || targetUrlObj.origin;
     if (targetUrlObj.hostname.includes('douban.com')) {
         referer = 'https://movie.douban.com/';
@@ -121,8 +116,35 @@ async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const response = await fetch(targetUrl, { headers, redirect: 'follow' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
+    const finalHeaders = new Headers(response.headers);
+    finalHeaders.set('Access-Control-Allow-Origin', '*');
+    finalHeaders.set('Cache-Control', `public, max-age=${cacheTtl}`);
+
+    return new Response(response.body, {
+        status: 200,
+        headers: finalHeaders
+    });
+}
+
+async function fetchWithSmartHandling(targetUrl, userAgents, request) {
+    const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
+    const targetUrlObj = new URL(targetUrl);
+    let referer = request.headers.get('Referer') || targetUrlObj.origin;
+    if (targetUrlObj.hostname.includes('douban.com')) {
+        referer = 'https://movie.douban.com/';
+    }
+
+    const headers = new Headers({
+        'User-Agent': ua,
+        'Accept': '*/*',
+        'Accept-Language': request.headers.get('Accept-Language') || 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': referer,
+    });
+
+    const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
     const contentType = response.headers.get('content-type') || '';
-    // 只有 MIME 类型包含 text 或 mpegurl 时，才认为是文本
     const isText = contentType.includes('text/') || 
                    contentType.includes('application/x-mpegurl') || 
                    contentType.includes('application/vnd.apple.mpegurl');
@@ -158,11 +180,16 @@ function getTargetUrlFromPath(pathname) {
     } catch (e) { return null; }
 }
 
+function createCorsHeaders(headers) {
+    const h = new Headers(headers);
+    h.set("Access-Control-Allow-Origin", "*");
+    h.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+    h.set("Access-Control-Allow-Headers", "*");
+    return h;
+}
+
 function createResponse(body, status = 200, headers = {}, request) {
-    const responseHeaders = new Headers(headers);
-    responseHeaders.set("Access-Control-Allow-Origin", "*");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-    responseHeaders.set("Access-Control-Allow-Headers", "*");
+    const responseHeaders = createCorsHeaders(headers);
     return new Response(body, { status, headers: responseHeaders });
 }
 
@@ -459,4 +486,5 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
 
