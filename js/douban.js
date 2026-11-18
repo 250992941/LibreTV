@@ -213,8 +213,8 @@ async function fillAndSearchWithDouban(title) {
                 selectedAPIs.push('dbzy');
                 localStorage.setItem('selectedAPIs', JSON.stringify(selectedAPIs));
                 
-                // 更新选中API计数（如果有这个元素）
-                const countEl = document.getElementById('selectedAPICount');
+                // 如果有这个元素，更新选中API计数
+                const countEl = document.getElementById('selectedApiCount');
                 if (countEl) {
                     countEl.textContent = selectedAPIs.length;
                 }
@@ -230,7 +230,7 @@ async function fillAndSearchWithDouban(title) {
         input.value = safeTitle;
         await search(); // 使用已有的search函数执行搜索
         
-        // 更新浏览器URL，使其反映当前的搜索状态
+        // 同时更新浏览器URL，使其反映当前的搜索状态
         try {
             // 使用URI编码确保特殊字符能够正确显示
             const encodedQuery = encodeURIComponent(safeTitle);
@@ -528,19 +528,17 @@ function renderDoubanCards(data, container) {
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;');
             
-            // 处理图片URL
-            // 1. 直接使用豆瓣图片URL (添加no-referrer属性)
+            // 【核心修复】处理图片URL
+            // 不再尝试直接加载，而是直接使用代理 URL。
+            // 这样可以确保所有的图片请求都经过 Cloudflare 代理，从而应用我们设置的“深度伪装”逻辑。
             const originalCoverUrl = item.cover;
-            
-            // 2. 也准备代理URL作为备选
             const proxiedCoverUrl = PROXY_URL + encodeURIComponent(originalCoverUrl);
             
             // 为不同设备优化卡片布局
             card.innerHTML = `
                 <div class="relative w-full aspect-[2/3] overflow-hidden cursor-pointer" onclick="fillAndSearchWithDouban('${safeTitle}')">
-                    <img src="${originalCoverUrl}" alt="${safeTitle}" 
+                    <img src="${proxiedCoverUrl}" alt="${safeTitle}" 
                         class="w-full h-full object-cover transition-transform duration-500 hover:scale-110"
-                        onerror="this.onerror=null; this.src='${proxiedCoverUrl}'; this.classList.add('object-contain');"
                         loading="lazy" referrerpolicy="no-referrer">
                     <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent opacity-60"></div>
                     <div class="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded-sm">
@@ -738,7 +736,7 @@ function deleteTag(tag) {
         return;
     }
     
-    // 确定当前使用的是电影还是电视剧标签
+    // 确定当前使用的是电影还是电视剧
     const isMovie = doubanMovieTvCurrentSwitch === 'movie';
     const currentTags = isMovie ? movieTags : tvTags;
     
@@ -752,7 +750,7 @@ function deleteTag(tag) {
         // 保存到本地存储
         saveUserTags();
         
-        // 如果当前选中的是被删除的标签，则重置为"热门"
+        // 如果当前选中的是被删除的，则重置为"热门"
         if (doubanCurrentTag === tag) {
             doubanCurrentTag = '热门';
             doubanPageStart = 0;
