@@ -1,7 +1,7 @@
 // functions/proxy/[[path]].js
 
 // --- 常量定义 ---
-// 极其精准的媒体文件正则，支持带参数的 URL
+// 极其精准的媒体文件正则，用于识别哪些文件需要“直接搬运”而不进行文本解析
 const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|wmv|flv|f4v|m4v|3gp|3g2|ts|mts|m2ts|mp3|wav|ogg|aac|m4a|flac|wma|alac|aiff|opus|jpg|jpeg|png|gif|webp|bmp|tiff|svg|avif|heic)(\?.*)?$/i;
 
 /**
@@ -86,7 +86,7 @@ export async function onRequest(context) {
             finalHeaders.set('Access-Control-Allow-Origin', '*');
             finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
-            // 直接返回 response.body (Stream)，不调用 .text()，保证图片不损坏
+            // 【关键修复】直接返回 response.body (Stream)，不调用 .text()，保证二进制数据 100% 完整
             return new Response(response.body, {
                 status: 200,
                 headers: finalHeaders
@@ -98,10 +98,8 @@ export async function onRequest(context) {
     }
 }
 
-// --- 辅助函数 ---
-
 /**
- * 核心修复：智能 fetch，根据内容类型决定是否转为文本
+ * 智能 Fetch：根据 Content-Type 预判是文本还是二进制
  */
 async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
@@ -123,12 +121,16 @@ async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const response = await fetch(targetUrl, { headers, redirect: 'follow' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    // 预判是否为文本（M3U8）
     const contentType = response.headers.get('content-type') || '';
-    const isText = contentType.includes('mpegurl') || contentType.includes('text/plain') || contentType.includes('application/x-mpegurl');
+    // 只有 MIME 类型包含 text 或 mpegurl 时，才认为是文本
+    const isText = contentType.includes('text/') || 
+                   contentType.includes('application/x-mpegurl') || 
+                   contentType.includes('application/vnd.apple.mpegurl');
 
     return { response, isText };
 }
+
+// --- 辅助函数 ---
 
 async function validateAuth(request, env) {
     const url = new URL(request.url);
