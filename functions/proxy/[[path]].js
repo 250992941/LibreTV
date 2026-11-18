@@ -1,4 +1,4 @@
-// functions/p2/[[path]].js
+// functions/proxy/[[path]].js
 
 // --- 常量定义 ---
 const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|wmv|flv|f4v|m4v|3gp|3g2|ts|mts|m2ts|mp3|wav|ogg|aac|m4a|flac|wma|alac|aiff|opus|jpg|jpeg|png|gif|webp|bmp|tiff|svg|avif|heic)(\?.*)?$/i;
@@ -10,7 +10,7 @@ export async function onRequest(context) {
     const { request, env, waitUntil } = context;
     const url = new URL(request.url);
 
-    // 1. 解析目标 URL (匹配 /p2/ 路径)
+    // 1. 解析目标 URL
     const targetUrl = getTargetUrlFromPath(url.pathname);
     if (!targetUrl) {
         return createResponse("无效的代理请求", 400, {}, request);
@@ -35,7 +35,8 @@ export async function onRequest(context) {
         }
     }
 
-    // 4. 缓存检查 (仅针对文本/M3U8)
+    // 4. 缓存检查 (使用 v2 版本键名以强制刷新)
+    // 【关键改动】将 proxy_raw 改为 proxy_v2，彻底避开旧的损坏缓存
     const cacheKey = `proxy_v2:${targetUrl}`; 
     let kvNamespace = env.LIBRETV_PROXY_KV;
 
@@ -61,12 +62,12 @@ export async function onRequest(context) {
 
         // 6. 根据内容类型进行处理
         if (isMedia || contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/')) {
-            // --- 情况 A: 图片/视频二进制内容 (核心修复：绝对不使用 .text()) ---
+            // --- 情况 A: 图片/视频二进制内容 (绝对不使用 .text()) ---
             const finalHeaders = new Headers(response.headers);
             finalHeaders.set('Access-Control-Allow-Origin', '*');
-            // 强制不缓存，防止旧的坏数据再次中毒
-            finalHeaders.set('Cache-Control', 'no-store, max-age=0');
+            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
+            // 直接流式透传，保证数据 100% 完美
             return new Response(response.body, {
                 status: 200,
                 headers: finalHeaders
@@ -75,6 +76,7 @@ export async function onRequest(context) {
             // --- 情况 B: M3U8 文本内容 ---
             const content = await response.text();
 
+            // 写入新版本的缓存 (v2)
             if (kvNamespace) {
                 try {
                     const headersToCache = {};
@@ -98,7 +100,7 @@ export async function onRequest(context) {
 }
 
 /**
- * 智能 Fetch (包含豆瓣伪装)
+ * 智能 Fetch
  */
 async function fetchWithSmartHandling(targetUrl, userAgents, request) {
     const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
@@ -145,7 +147,7 @@ async function validateAuth(request, env) {
 }
 
 function getTargetUrlFromPath(pathname) {
-    const encodedUrl = pathname.replace(/^\/p2\//, '');
+    const encodedUrl = pathname.replace(/^\/proxy\//, '');
     if (!encodedUrl) return null;
     try {
         let decoded = decodeURIComponent(encodedUrl);
@@ -454,3 +456,7 @@ export default async function handler(req, res) {
 // getTargetUrlFromPath, getBaseUrl, resolveUrl, rewriteUrlToProxy, getRandomUserAgent,
 // fetchContentWithType, isM3u8Content, processKeyLine, processMapLine,
 // processMediaPlaylist, processM3u8Content, processMasterPlaylist
+
+
+
+
